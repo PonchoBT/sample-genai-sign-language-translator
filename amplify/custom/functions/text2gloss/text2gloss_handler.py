@@ -2,6 +2,8 @@ import json
 import os
 
 import boto3
+from strands import tool
+
 
 eng_to_asl_model = os.environ['ENG_TO_ASL_MODEL']
 
@@ -51,7 +53,7 @@ def lambda_handler(event, context):
     return {'Gloss': text_to_asl_gloss(event.get("Text")),
             'Text': event.get("Text")}
 
-
+@tool
 def text_to_asl_gloss(text):
     bedrock_client = boto3.client(service_name="bedrock-runtime")
     # create the prompt

@@ -9,6 +9,7 @@ import boto3
 from boto3.dynamodb.conditions import Key
 import uuid
 import pathlib
+from strands import tool
 
 pose_bucket = os.environ['POSE_BUCKET']
 asl_data_bucket = os.environ['ASL_DATA_BUCKET']
@@ -36,7 +37,7 @@ def lambda_handler(event, context):
     # Get the Gloss from event
     return gloss_to_video(event.get("Gloss"),event.get('Text'))
 
-
+@tool
 def gloss_to_video(gloss_sentence,text=None, pose_only=False, pre_sign=True):
     uniq_key = str(uuid.uuid4())
 
@@ -114,6 +115,7 @@ def process_videos(return_dict, video_type, sign_ids, uniq_key, pre_sign):
     # combine the sign videos using subprocess with arguments list
     ffmpeg_args = [
         "/opt/bin/ffmpeg",
+        # "/opt/homebrew/bin/ffmpeg",
         "-f", "concat",
         "-safe", "0",
         "-i", f"{temp_folder}{video_type}.txt",

@@ -2,3 +2,5 @@ node_modules
 dist
 .amplify
 amplify_outputs.json
+.DS_Store
+**/__pycache__/** 
