@@ -3,10 +3,48 @@ import os
 import time
 import logging
 from typing import Optional
+import sys
+from pathlib import Path
 
 import boto3
 from botocore.exceptions import ClientError, BotoCoreError
 from strands import tool
+
+# Add signlanguageagent to path for error handling imports
+current_dir = Path(__file__).parent
+agent_dir = current_dir.parent / 'signlanguageagent'
+if agent_dir.exists():
+    sys.path.insert(0, str(agent_dir))
+
+try:
+    from error_handling import (
+        bedrock_retry, handle_tool_error, FallbackStrategy,
+        with_retry_and_circuit_breaker, RetryConfig, CircuitBreakerConfig
+    )
+    ERROR_HANDLING_AVAILABLE = True
+except ImportError as e:
+    logger.warning(f"Error handling module not available: {e}")
+    ERROR_HANDLING_AVAILABLE = False
+    # Create dummy decorator if error handling not available
+    def bedrock_retry(func):
+        return func
+
+try:
+    from performance import (
+        with_performance_monitoring, with_response_caching,
+        get_optimized_bedrock_client, optimize_bedrock_request
+    )
+    PERFORMANCE_AVAILABLE = True
+except ImportError as e:
+    logger.warning(f"Performance module not available: {e}")
+    PERFORMANCE_AVAILABLE = False
+    # Create dummy decorators if performance not available
+    def with_performance_monitoring(func):
+        return func
+    def with_response_caching(cache_key_func=None):
+        def decorator(func):
+            return func
+        return decorator
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -68,9 +106,16 @@ def lambda_handler(event, context):
         return {'Error': f'Translation failed: {str(e)}'}
 
 
+def _text_cache_key(text: str) -> str:
+    """Generate cache key for text-to-gloss conversion"""
+    return f"text2gloss:{text.strip().lower()}"
+
 @tool
+@bedrock_retry
+@with_performance_monitoring
+@with_response_caching(cache_key_func=lambda text: _text_cache_key(text))
 def text_to_asl_gloss(text: str) -> str:
-    """Convert English text to ASL gloss notation with error handling and retry logic
+    """Convert English text to ASL gloss notation with enhanced error handling
     
     Args:
         text: English text to convert to ASL gloss
@@ -86,74 +131,85 @@ def text_to_asl_gloss(text: str) -> str:
         raise ValueError("Text cannot be empty")
     
     text = text.strip()
-    max_retries = 3
-    base_delay = 1.0
     
-    for attempt in range(max_retries):
-        try:
-            bedrock_client = boto3.client(service_name="bedrock-runtime")
+    try:
+        return _perform_text_to_gloss_conversion(text)
+    except Exception as e:
+        if ERROR_HANDLING_AVAILABLE:
+            error_info = handle_tool_error("text_to_asl_gloss", e, {"text": text})
+            logger.error(f"Text-to-gloss conversion failed: {error_info}")
             
-            # Create the prompt
-            prompt_data = construct_query(text)
-            conversation = [
-                {
-                    "role": "user",
-                    "content": [{"text": prompt_data}],
-                }
-            ]
-            
-            inference_config = {
-                "maxTokens": 3000, 
-                "temperature": 0.0, 
-                "topP": 0.5
-            }
+            # Try fallback strategy
+            try:
+                fallback_result = FallbackStrategy.text_to_gloss_fallback(text)
+                logger.info(f"Using fallback result for text-to-gloss: {fallback_result}")
+                return fallback_result
+            except Exception as fallback_error:
+                logger.error(f"Fallback strategy also failed: {fallback_error}")
+                raise RuntimeError(f"Text-to-gloss conversion failed: {str(e)}")
+        else:
+            raise RuntimeError(f"Text-to-gloss conversion failed: {str(e)}")
 
-            logger.info(f"Attempting text-to-gloss conversion (attempt {attempt + 1}/{max_retries})")
-            
+
+def _perform_text_to_gloss_conversion(text: str) -> str:
+    """Perform the actual text-to-gloss conversion with Bedrock"""
+    try:
+        # Use optimized Bedrock client if available
+        if PERFORMANCE_AVAILABLE:
+            bedrock_client = get_optimized_bedrock_client()
+        else:
+            bedrock_client = boto3.client(service_name="bedrock-runtime")
+        
+        # Create the prompt
+        prompt_data = construct_query(text)
+        conversation = [
+            {
+                "role": "user",
+                "content": [{"text": prompt_data}],
+            }
+        ]
+        
+        inference_config = {
+            "maxTokens": 3000, 
+            "temperature": 0.0, 
+            "topP": 0.5
+        }
+
+        logger.info(f"Performing text-to-gloss conversion for: '{text}'")
+        
+        # Use optimized Bedrock request if available
+        if PERFORMANCE_AVAILABLE:
+            response = optimize_bedrock_request(
+                eng_to_asl_model,
+                conversation,
+                inference_config
+            )
+        else:
             response = bedrock_client.converse(
                 modelId=eng_to_asl_model,
                 messages=conversation,
                 inferenceConfig=inference_config,
             )
 
-            gloss = response["output"]["message"]["content"][0]["text"]
-            
-            # Clean up the gloss output
-            gloss = gloss.strip()
-            if gloss.startswith("==>"):
-                gloss = gloss[3:].strip()
-            
-            logger.info(f"Successfully converted text to gloss: '{text}' -> '{gloss}'")
-            return gloss
-            
-        except ClientError as e:
-            error_code = e.response.get('Error', {}).get('Code', 'Unknown')
-            error_message = e.response.get('Error', {}).get('Message', 'Unknown')
-            
-            logger.warning(f"Bedrock ClientError on attempt {attempt + 1}: {error_code} - {error_message}")
-            
-            # Don't retry on certain error types
-            if error_code in ['ValidationException', 'AccessDeniedException']:
-                raise RuntimeError(f"Non-retryable error: {error_code} - {error_message}")
-            
-            if attempt == max_retries - 1:
-                raise RuntimeError(f"Text-to-gloss conversion failed after {max_retries} attempts: {error_message}")
-                
-        except BotoCoreError as e:
-            logger.warning(f"BotoCoreError on attempt {attempt + 1}: {str(e)}")
-            if attempt == max_retries - 1:
-                raise RuntimeError(f"Text-to-gloss conversion failed after {max_retries} attempts: {str(e)}")
-                
-        except Exception as e:
-            logger.error(f"Unexpected error on attempt {attempt + 1}: {str(e)}")
-            if attempt == max_retries - 1:
-                raise RuntimeError(f"Text-to-gloss conversion failed after {max_retries} attempts: {str(e)}")
+        gloss = response["output"]["message"]["content"][0]["text"]
         
-        # Exponential backoff with jitter
-        if attempt < max_retries - 1:
-            delay = base_delay * (2 ** attempt) + (time.time() % 1)  # Add jitter
-            logger.info(f"Retrying in {delay:.2f} seconds...")
-            time.sleep(delay)
+        # Clean up the gloss output
+        gloss = gloss.strip()
+        if gloss.startswith("==>"):
+            gloss = gloss[3:].strip()
+        
+        if not gloss:
+            raise RuntimeError("Bedrock returned empty gloss result")
+        
+        logger.info(f"Successfully converted text to gloss: '{text}' -> '{gloss}'")
+        return gloss
+        
+    except (ClientError, BotoCoreError) as e:
+        # Let the retry decorator handle AWS-specific errors
+        raise e
+    except Exception as e:
+        logger.error(f"Unexpected error in text-to-gloss conversion: {str(e)}")
+        raise RuntimeError(f"Text-to-gloss conversion failed: {str(e)}")
 
 
 if __name__ == "__main__":

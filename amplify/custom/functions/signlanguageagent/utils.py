@@ -255,3 +255,98 @@ def get_file_size_mb(file_path: Union[str, Path]) -> float:
         return size_bytes / (1024 * 1024)
     except (OSError, FileNotFoundError):
         return 0.0
+
+def format_response_for_api(agent_response: Any, request_params: Dict[str, Any], response_format: str = "rest_api") -> Dict[str, Any]:
+    """
+    Format agent response for different API endpoints using response formatters
+    
+    Args:
+        agent_response: Raw agent response
+        request_params: Original request parameters
+        response_format: Target format ("rest_api", "websocket", "legacy", "enhanced")
+        
+    Returns:
+        dict: Formatted response data
+    """
+    try:
+        from response_formatters import (
+            format_rest_api_response,
+            format_websocket_response,
+            format_legacy_response,
+            format_enhanced_response
+        )
+        
+        if response_format == "rest_api":
+            return format_rest_api_response(agent_response, request_params)
+        elif response_format == "websocket":
+            connection_id = request_params.get('connection_id', 'default')
+            return format_websocket_response(agent_response, request_params, connection_id)
+        elif response_format == "legacy":
+            execution_arn = request_params.get('execution_arn')
+            return format_legacy_response(agent_response, execution_arn)
+        elif response_format == "enhanced":
+            return format_enhanced_response(agent_response, request_params)
+        else:
+            logger = logging.getLogger('genasl_agent')
+            logger.warning(f"Unknown response format: {response_format}")
+            return {"message": str(agent_response), "status": "completed"}
+            
+    except ImportError:
+        logger = logging.getLogger('genasl_agent')
+        logger.warning("Response formatters not available, using basic formatting")
+        return {"message": str(agent_response), "status": "completed"}
+    except Exception as e:
+        logger = logging.getLogger('genasl_agent')
+        logger.error(f"Error formatting response: {e}")
+        return {"error": str(e), "status": "failed"}
+
+def parse_structured_response(response_text: str) -> Dict[str, Any]:
+    """
+    Parse structured data from agent response text
+    
+    Args:
+        response_text: Agent response as text
+        
+    Returns:
+        dict: Parsed structured data
+    """
+    import re
+    
+    parsed_data = {}
+    
+    # Extract URLs
+    url_pattern = re.compile(r'https?://[^\s<>"{}|\\^`\[\]]+')
+    urls = url_pattern.findall(response_text)
+    
+    if urls:
+        for i, url in enumerate(urls):
+            if 'pose' in url.lower():
+                parsed_data['PoseURL'] = url
+            elif 'sign' in url.lower():
+                parsed_data['SignURL'] = url
+            elif 'avatar' in url.lower():
+                parsed_data['AvatarURL'] = url
+            elif i == 0 and 'PoseURL' not in parsed_data:
+                parsed_data['PoseURL'] = url
+            elif i == 1 and 'SignURL' not in parsed_data:
+                parsed_data['SignURL'] = url
+            elif i == 2 and 'AvatarURL' not in parsed_data:
+                parsed_data['AvatarURL'] = url
+    
+    # Extract gloss
+    gloss_pattern = re.compile(r'(?:ASL Gloss|Gloss):\s*([^\n]+)', re.IGNORECASE)
+    gloss_match = gloss_pattern.search(response_text)
+    if gloss_match:
+        parsed_data['Gloss'] = gloss_match.group(1).strip()
+    
+    # Extract text
+    text_pattern = re.compile(r'(?:Original text|Text):\s*"([^"]+)"', re.IGNORECASE)
+    text_match = text_pattern.search(response_text)
+    if text_match:
+        parsed_data['Text'] = text_match.group(1).strip()
+    
+    # If no structured data found, include the full response
+    if not parsed_data:
+        parsed_data['message'] = response_text
+    
+    return parsed_data

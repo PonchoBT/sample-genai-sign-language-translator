@@ -8,6 +8,7 @@ import {Stack, StackProps, Duration, RemovalPolicy} from 'aws-cdk-lib';
 import * as tasks from 'aws-cdk-lib/aws-stepfunctions-tasks';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as logs from 'aws-cdk-lib/aws-logs'
+import * as cloudwatch from 'aws-cdk-lib/aws-cloudwatch';
 
 import * as apigateway from 'aws-cdk-lib/aws-apigateway';
 import * as ddb from 'aws-cdk-lib/aws-dynamodb';
@@ -92,7 +93,8 @@ export class GenASLBackendStack extends Stack {
             functionName: 'BlendedPoseFunction-' + (config.amplifyEnv || 'dev'),
             description: 'This function creates a blended pose',
             timeout: Duration.seconds(config.lambdaSettings.timeout),
-            memorySize: config.lambdaSettings.memorySize,
+            memorySize: 2048, // Increased memory for video processing
+            tracing: lambda.Tracing.ACTIVE, // Enable X-Ray tracing
             environment: {
             POSE_BUCKET: config.pose_bucket,
             ASL_DATA_BUCKET: this.dataBucket.bucketName,
@@ -120,8 +122,9 @@ export class GenASLBackendStack extends Stack {
             functionName: 'Gloss2PoseFunction-' + (config.amplifyEnv || 'dev'),
             description: 'This function converts gloss to pose',
             timeout: Duration.seconds(config.lambdaSettings.timeout),
-            memorySize: config.lambdaSettings.memorySize,
+            memorySize: 2048, // Increased memory for video processing
             layers: [ffmpegLayer],
+            tracing: lambda.Tracing.ACTIVE, // Enable X-Ray tracing
             environment: {
             POSE_BUCKET: config.pose_bucket,
             ASL_DATA_BUCKET: this.dataBucket.bucketName,
@@ -156,8 +159,9 @@ export class GenASLBackendStack extends Stack {
             code: lambda.Code.fromAsset('./amplify/custom/functions/text2gloss'),
             functionName: 'Text2GlossFunction-' + process.env.AMPLIFY_ENV,
             description: 'This function converts text to gloss',
-            timeout: Duration.seconds(config.lambdaSettings.timeout),
-            memorySize: config.lambdaSettings.memorySize,
+            timeout: Duration.seconds(300), // Reduced timeout for text processing
+            memorySize: 512, // Reduced memory for text processing
+            tracing: lambda.Tracing.ACTIVE, // Enable X-Ray tracing
             environment: {
                 ENG_TO_ASL_MODEL: config.eng_to_asl_model,
             },
@@ -175,8 +179,8 @@ export class GenASLBackendStack extends Stack {
             code: lambda.Code.fromAsset('./amplify/custom/functions/process_transcription'),
             functionName: 'ProcessTranscriptionFunction-' + process.env.AMPLIFY_ENV,
             description: 'This function processes the transcription job result',
-            timeout: Duration.seconds(config.lambdaSettings.timeout),
-            memorySize: config.lambdaSettings.memorySize,
+            timeout: Duration.seconds(120), // Reduced timeout for transcription processing
+            memorySize: 512, // Reduced memory for transcription processing
         });
 
     processTranscriptionFunction.addToRolePolicy(new iam.PolicyStatement({
@@ -339,7 +343,8 @@ export class GenASLBackendStack extends Stack {
           memorySize: config.lambdaSettings.memorySize,
           environment: {
               STATE_MACHINE_ARN: stateMachine.stateMachineArn,
-              STATE_MACHINE_ARN_BLENDED_POSE: blendedPoseStateMachine.stateMachineArn
+              STATE_MACHINE_ARN_BLENDED_POSE: blendedPoseStateMachine.stateMachineArn,
+              AGENT_FUNCTION_NAME: signLanguageAgentFunction.functionName
           },
       });
 
@@ -352,6 +357,227 @@ export class GenASLBackendStack extends Stack {
           ],
           resources: ["*"],
         }));
+
+        // Grant audio2SignFunction permission to invoke the agent
+        audio2SignFunction.addToRolePolicy(new iam.PolicyStatement({
+            effect: iam.Effect.ALLOW,
+            actions: ['lambda:InvokeFunction'],
+            resources: [signLanguageAgentFunction.functionArn],
+        }));
+
+        // Create the Strands Agent Lambda function
+        const signLanguageAgentFunction = new lambda.Function(this, 'SignLanguageAgentFunction', {
+            runtime: lambda.Runtime.PYTHON_3_11,
+            handler: 'slagent.app.entrypoint',
+            code: lambda.Code.fromAsset('./amplify/custom/functions/signlanguageagent'),
+            functionName: 'SignLanguageAgentFunction-' + (config.amplifyEnv || 'dev'),
+            description: 'Strands-based agent for ASL translation orchestration',
+            timeout: Duration.seconds(900), // 15 minutes for complex workflows
+            memorySize: 1024, // Higher memory for agent processing
+            layers: [ffmpegLayer],
+            tracing: lambda.Tracing.ACTIVE, // Enable X-Ray tracing
+            environment: {
+                POSE_BUCKET: config.pose_bucket,
+                ASL_DATA_BUCKET: this.dataBucket.bucketName,
+                KEY_PREFIX: config.key_prefix,
+                TABLE_NAME: config.table_name,
+                ENG_TO_ASL_MODEL: config.eng_to_asl_model,
+                ASL_TO_ENG_MODEL: config.asl_to_eng_model,
+                REGION: config.region,
+                // AgentCore specific environment variables
+                BEDROCK_AGENT_RUNTIME_REGION: config.region,
+                LOG_LEVEL: 'INFO'
+            },
+        });
+
+        // Grant comprehensive IAM permissions for the agent
+        signLanguageAgentFunction.addToRolePolicy(new iam.PolicyStatement({
+            effect: iam.Effect.ALLOW,
+            actions: [
+                'bedrock:*',
+                'bedrock-agent:*',
+                'bedrock-runtime:*'
+            ],
+            resources: ['*'],
+        }));
+
+        signLanguageAgentFunction.addToRolePolicy(new iam.PolicyStatement({
+            effect: iam.Effect.ALLOW,
+            actions: [
+                'transcribe:StartTranscriptionJob',
+                'transcribe:GetTranscriptionJob',
+                'transcribe:ListTranscriptionJobs'
+            ],
+            resources: ['*'],
+        }));
+
+        signLanguageAgentFunction.addToRolePolicy(new iam.PolicyStatement({
+            effect: iam.Effect.ALLOW,
+            actions: [
+                'dynamodb:GetItem',
+                'dynamodb:Scan',
+                'dynamodb:Query',
+                'dynamodb:PutItem',
+                'dynamodb:UpdateItem'
+            ],
+            resources: [
+                this.formatArn({
+                    service: 'dynamodb',
+                    resource: 'table',
+                    resourceName: config.table_name,
+                }),
+                this.formatArn({
+                    service: 'dynamodb',
+                    resource: 'table',
+                    resourceName: 'Pose_Data*',
+                })
+            ],
+        }));
+
+        signLanguageAgentFunction.addToRolePolicy(new iam.PolicyStatement({
+            effect: iam.Effect.ALLOW,
+            actions: [
+                'kinesisvideo:*'
+            ],
+            resources: ['*'],
+        }));
+
+        signLanguageAgentFunction.addToRolePolicy(new iam.PolicyStatement({
+            effect: iam.Effect.ALLOW,
+            actions: [
+                'logs:CreateLogGroup',
+                'logs:CreateLogStream',
+                'logs:PutLogEvents'
+            ],
+            resources: ['*'],
+        }));
+
+        // Grant S3 permissions
+        const avatarBucketForAgent = s3.Bucket.fromBucketName(this, 'AvatarBucketForAgent', config.pose_bucket);
+        avatarBucketForAgent.grantRead(signLanguageAgentFunction);
+        this.dataBucket.grantReadWrite(signLanguageAgentFunction);
+
+        // Configure monitoring and logging
+        
+        // Create CloudWatch Log Groups for better log organization
+        const agentLogGroup = new logs.LogGroup(this, 'SignLanguageAgentLogGroup', {
+            logGroupName: `/aws/lambda/${signLanguageAgentFunction.functionName}`,
+            retention: logs.RetentionDays.ONE_MONTH,
+            removalPolicy: RemovalPolicy.DESTROY,
+        });
+
+        const text2GlossLogGroup = new logs.LogGroup(this, 'Text2GlossLogGroup', {
+            logGroupName: `/aws/lambda/${text2GlossFunction.functionName}`,
+            retention: logs.RetentionDays.ONE_MONTH,
+            removalPolicy: RemovalPolicy.DESTROY,
+        });
+
+        const gloss2PoseLogGroup = new logs.LogGroup(this, 'Gloss2PoseLogGroup', {
+            logGroupName: `/aws/lambda/${gloss2PoseFunction.functionName}`,
+            retention: logs.RetentionDays.ONE_MONTH,
+            removalPolicy: RemovalPolicy.DESTROY,
+        });
+
+        // X-Ray tracing is enabled via the tracing property on each function
+
+        // Grant X-Ray permissions
+        const xrayPolicy = new iam.PolicyStatement({
+            effect: iam.Effect.ALLOW,
+            actions: [
+                'xray:PutTraceSegments',
+                'xray:PutTelemetryRecords'
+            ],
+            resources: ['*'],
+        });
+
+        signLanguageAgentFunction.addToRolePolicy(xrayPolicy);
+        text2GlossFunction.addToRolePolicy(xrayPolicy);
+        gloss2PoseFunction.addToRolePolicy(xrayPolicy);
+        blendedPoseFunction.addToRolePolicy(xrayPolicy);
+
+        // Create custom CloudWatch metrics for translation pipeline monitoring
+        const translationMetricsNamespace = 'GenASL/Translation';
+
+        // Create CloudWatch Dashboard for monitoring
+        const dashboard = new cloudwatch.Dashboard(this, 'GenASLDashboard', {
+            dashboardName: `GenASL-Dashboard-${config.amplifyEnv || 'dev'}`,
+        });
+
+        // Add Lambda function metrics to dashboard
+        dashboard.addWidgets(
+            new cloudwatch.GraphWidget({
+                title: 'Agent Function Invocations',
+                left: [signLanguageAgentFunction.metricInvocations()],
+                right: [signLanguageAgentFunction.metricErrors()],
+            }),
+            new cloudwatch.GraphWidget({
+                title: 'Agent Function Duration',
+                left: [signLanguageAgentFunction.metricDuration()],
+            }),
+            new cloudwatch.GraphWidget({
+                title: 'Translation Pipeline Functions',
+                left: [
+                    text2GlossFunction.metricInvocations(),
+                    gloss2PoseFunction.metricInvocations(),
+                    blendedPoseFunction.metricInvocations()
+                ],
+                right: [
+                    text2GlossFunction.metricErrors(),
+                    gloss2PoseFunction.metricErrors(),
+                    blendedPoseFunction.metricErrors()
+                ],
+            }),
+            new cloudwatch.GraphWidget({
+                title: 'API Gateway Metrics',
+                left: [
+                    new cloudwatch.Metric({
+                        namespace: 'AWS/ApiGateway',
+                        metricName: 'Count',
+                        dimensionsMap: {
+                            ApiName: this.api.restApiName,
+                        },
+                    }),
+                ],
+                right: [
+                    new cloudwatch.Metric({
+                        namespace: 'AWS/ApiGateway',
+                        metricName: '4XXError',
+                        dimensionsMap: {
+                            ApiName: this.api.restApiName,
+                        },
+                    }),
+                    new cloudwatch.Metric({
+                        namespace: 'AWS/ApiGateway',
+                        metricName: '5XXError',
+                        dimensionsMap: {
+                            ApiName: this.api.restApiName,
+                        },
+                    }),
+                ],
+            })
+        );
+
+        // Create CloudWatch Alarms for critical errors
+        const agentErrorAlarm = new cloudwatch.Alarm(this, 'AgentErrorAlarm', {
+            metric: signLanguageAgentFunction.metricErrors(),
+            threshold: 5,
+            evaluationPeriods: 2,
+            alarmDescription: 'Sign Language Agent function errors',
+        });
+
+        const translationPipelineErrorAlarm = new cloudwatch.Alarm(this, 'TranslationPipelineErrorAlarm', {
+            metric: new cloudwatch.MathExpression({
+                expression: 'text2gloss_errors + gloss2pose_errors + blended_errors',
+                usingMetrics: {
+                    text2gloss_errors: text2GlossFunction.metricErrors(),
+                    gloss2pose_errors: gloss2PoseFunction.metricErrors(),
+                    blended_errors: blendedPoseFunction.metricErrors(),
+                },
+            }),
+            threshold: 10,
+            evaluationPeriods: 2,
+            alarmDescription: 'Translation pipeline function errors',
+        });
 
 
          // Create the Lambda function
@@ -428,6 +654,25 @@ export class GenASLBackendStack extends Stack {
       }],
     });
 
+    // Add Strands Agent API endpoint
+    const agentResource = this.api.root.addResource('agent');
+    agentResource.addMethod('POST', new apigateway.LambdaIntegration(signLanguageAgentFunction, {
+      proxy: true,
+      integrationResponses: [{
+        statusCode: '200',
+        responseParameters: {
+          'method.response.header.Access-Control-Allow-Origin': "'*'",
+        },
+      }],
+    }), {
+      methodResponses: [{
+        statusCode: '200',
+        responseParameters: {
+          'method.response.header.Access-Control-Allow-Origin': true,
+        },
+      }],
+    });
+
     /**Websocket Stack */
     const websocketTable = new ddb.Table(this, 'ConnectionsTable-'+ process.env.AMPLIFY_ENV, {
         partitionKey: { name: 'pk', type: ddb.AttributeType.STRING },
@@ -442,9 +687,9 @@ export class GenASLBackendStack extends Stack {
         code: lambda.Code.fromAsset('./amplify/custom/functions/websocket'),
         functionName: 'OnConnectFunction-'+ process.env.AMPLIFY_ENV,
         description: 'This function is called when a user connects to the websocket',
-        timeout: Duration.seconds(config.lambdaSettings.timeout),
+        timeout: Duration.seconds(30), // Reduced timeout for connection handling
         layers: [ffmpegLayer],
-        memorySize: config.lambdaSettings.memorySize,
+        memorySize: 512, // Reduced memory for simple connection handling
         environment: {
             DYNAMO_TABLE_NAME: websocketTable.tableName,
             INPUT_BUCKET: this.dataBucket.bucketName,
@@ -459,9 +704,9 @@ export class GenASLBackendStack extends Stack {
         code: lambda.Code.fromAsset('./amplify/custom/functions/websocket'),
         functionName: 'OnDisConnectFunction-'+ process.env.AMPLIFY_ENV,
         description: 'This function is called when a user disconnects to the websocket',
-        timeout: Duration.seconds(config.lambdaSettings.timeout),
+        timeout: Duration.seconds(30), // Reduced timeout for disconnection handling
         layers: [ffmpegLayer],
-        memorySize: config.lambdaSettings.memorySize,
+        memorySize: 512, // Reduced memory for simple disconnection handling
         environment: {
             DYNAMO_TABLE_NAME: websocketTable.tableName,
             INPUT_BUCKET: this.dataBucket.bucketName,
@@ -475,13 +720,15 @@ export class GenASLBackendStack extends Stack {
         handler: 'handler.default',           // Specify the handler function
         code: lambda.Code.fromAsset('./amplify/custom/functions/websocket'),
         functionName: 'OnDefaultFunction-'+ process.env.AMPLIFY_ENV,
-        timeout: Duration.seconds(config.lambdaSettings.timeout),
-        memorySize: config.lambdaSettings.memorySize,
+        timeout: Duration.seconds(300), // Increased timeout for agent communication
+        memorySize: 1024, // Adequate memory for agent communication and processing
         layers: [ffmpegLayer],
+        tracing: lambda.Tracing.ACTIVE, // Enable X-Ray tracing
         environment: {
             DYNAMO_TABLE_NAME: websocketTable.tableName,
             INPUT_BUCKET: this.dataBucket.bucketName,
-            ASL_TO_ENG_MODEL: config.asl_to_eng_model
+            ASL_TO_ENG_MODEL: config.asl_to_eng_model,
+            AGENT_FUNCTION_NAME: signLanguageAgentFunction.functionName
         },
     });
     websocketTable.grantReadWriteData(onConnectFunction);
@@ -503,6 +750,15 @@ export class GenASLBackendStack extends Stack {
 
     OnDefaultFunction.addToRolePolicy(bedrockPolicy)
     OnDefaultFunction.addToRolePolicy(kvsPolicy)
+    OnDefaultFunction.addToRolePolicy(xrayPolicy)
+    
+    // Grant WebSocket function permission to invoke the agent
+    OnDefaultFunction.addToRolePolicy(new iam.PolicyStatement({
+        effect: iam.Effect.ALLOW,
+        actions: ['lambda:InvokeFunction'],
+        resources: [signLanguageAgentFunction.functionArn],
+    }));
+    
     // Add S3 full access permissions for genasl-data bucket
     this.dataBucket.grantReadWrite(onConnectFunction);
     this.dataBucket.grantReadWrite(OnDefaultFunction);

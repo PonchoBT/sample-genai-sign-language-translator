@@ -4,12 +4,33 @@ import time
 import logging
 from typing import Optional, Dict, Any
 import uuid
+import sys
+from pathlib import Path
 
 import boto3
 from botocore.exceptions import ClientError, BotoCoreError
 import requests
 import re
 from strands import tool
+
+# Add signlanguageagent to path for error handling imports
+current_dir = Path(__file__).parent
+agent_dir = current_dir.parent / 'signlanguageagent'
+if agent_dir.exists():
+    sys.path.insert(0, str(agent_dir))
+
+try:
+    from error_handling import (
+        transcribe_retry, handle_tool_error, FallbackStrategy,
+        with_retry_and_circuit_breaker, RetryConfig, CircuitBreakerConfig
+    )
+    ERROR_HANDLING_AVAILABLE = True
+except ImportError as e:
+    logger.warning(f"Error handling module not available: {e}")
+    ERROR_HANDLING_AVAILABLE = False
+    # Create dummy decorator if error handling not available
+    def transcribe_retry(func):
+        return func
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -48,8 +69,9 @@ def lambda_handler(event, context):
 
 
 @tool
+@transcribe_retry
 def process_audio_input(bucket_name: str, key_name: str) -> str:
-    """Process audio file and return transcribed text with comprehensive error handling
+    """Process audio file and return transcribed text with enhanced error handling
     
     Args:
         bucket_name: S3 bucket containing the audio file
@@ -74,25 +96,40 @@ def process_audio_input(bucket_name: str, key_name: str) -> str:
     logger.info(f"Starting audio processing for s3://{bucket_name}/{key_name}")
     
     try:
-        # Start transcription job
-        job_name = start_transcription_job(bucket_name, key_name)
-        
-        # Wait for job completion and get results
-        transcribed_text = wait_for_transcription_and_extract_text(job_name)
-        
-        logger.info(f"Successfully transcribed audio: '{transcribed_text[:100]}...'")
-        return transcribed_text
-        
+        return _perform_audio_processing(bucket_name, key_name)
     except Exception as e:
-        logger.error(f"Error in process_audio_input: {str(e)}")
-        raise RuntimeError(f"Audio processing failed: {str(e)}")
+        if ERROR_HANDLING_AVAILABLE:
+            error_info = handle_tool_error("process_audio_input", e, {
+                "bucket_name": bucket_name, "key_name": key_name
+            })
+            logger.error(f"Audio processing failed: {error_info}")
+            
+            # Try fallback strategy
+            try:
+                fallback_result = FallbackStrategy.audio_processing_fallback(bucket_name, key_name)
+                logger.info(f"Using fallback result for audio processing")
+                return fallback_result
+            except Exception as fallback_error:
+                logger.error(f"Fallback strategy also failed: {fallback_error}")
+                raise RuntimeError(f"Audio processing failed: {str(e)}")
+        else:
+            raise RuntimeError(f"Audio processing failed: {str(e)}")
+
+
+def _perform_audio_processing(bucket_name: str, key_name: str) -> str:
+    """Perform the actual audio processing and transcription"""
+    # Start transcription job
+    job_name = start_transcription_job(bucket_name, key_name)
+    
+    # Wait for job completion and get results
+    transcribed_text = wait_for_transcription_and_extract_text(job_name)
+    
+    logger.info(f"Successfully transcribed audio: '{transcribed_text[:100]}...'")
+    return transcribed_text
 
 
 def start_transcription_job(bucket_name: str, key_name: str) -> str:
-    """Start AWS Transcribe job with error handling and retry logic"""
-    max_retries = 3
-    base_delay = 2.0
-    
+    """Start AWS Transcribe job with enhanced error handling"""
     # Generate unique job name
     timestamp = int(time.time())
     random_suffix = str(uuid.uuid4())[:8]
@@ -101,59 +138,36 @@ def start_transcription_job(bucket_name: str, key_name: str) -> str:
     # Construct S3 URI
     media_uri = f"s3://{bucket_name}/{key_name}"
     
-    for attempt in range(max_retries):
-        try:
-            transcribe_client = boto3.client('transcribe', region_name=transcribe_region)
-            
-            # Determine media format from file extension
-            media_format = get_media_format(key_name)
-            
-            logger.info(f"Starting transcription job '{job_name}' (attempt {attempt + 1}/{max_retries})")
-            
-            response = transcribe_client.start_transcription_job(
-                TranscriptionJobName=job_name,
-                Media={'MediaFileUri': media_uri},
-                MediaFormat=media_format,
-                LanguageCode='en-US',
-                Settings={
-                    'ShowSpeakerLabels': False,
-                    'MaxSpeakerLabels': 2,
-                    'ShowAlternatives': False,
-                    'MaxAlternatives': 1
-                }
-            )
-            
-            logger.info(f"Successfully started transcription job: {job_name}")
-            return job_name
-            
-        except ClientError as e:
-            error_code = e.response.get('Error', {}).get('Code', 'Unknown')
-            error_message = e.response.get('Error', {}).get('Message', 'Unknown')
-            
-            logger.warning(f"Transcribe ClientError on attempt {attempt + 1}: {error_code} - {error_message}")
-            
-            # Don't retry on certain error types
-            if error_code in ['ValidationException', 'AccessDeniedException', 'ConflictException']:
-                raise RuntimeError(f"Non-retryable transcription error: {error_code} - {error_message}")
-            
-            if attempt == max_retries - 1:
-                raise RuntimeError(f"Failed to start transcription job after {max_retries} attempts: {error_message}")
-                
-        except BotoCoreError as e:
-            logger.warning(f"BotoCoreError on attempt {attempt + 1}: {str(e)}")
-            if attempt == max_retries - 1:
-                raise RuntimeError(f"Failed to start transcription job after {max_retries} attempts: {str(e)}")
-                
-        except Exception as e:
-            logger.error(f"Unexpected error on attempt {attempt + 1}: {str(e)}")
-            if attempt == max_retries - 1:
-                raise RuntimeError(f"Failed to start transcription job after {max_retries} attempts: {str(e)}")
+    try:
+        transcribe_client = boto3.client('transcribe', region_name=transcribe_region)
         
-        # Exponential backoff with jitter
-        if attempt < max_retries - 1:
-            delay = base_delay * (2 ** attempt) + (time.time() % 1)
-            logger.info(f"Retrying in {delay:.2f} seconds...")
-            time.sleep(delay)
+        # Determine media format from file extension
+        media_format = get_media_format(key_name)
+        
+        logger.info(f"Starting transcription job '{job_name}'")
+        
+        response = transcribe_client.start_transcription_job(
+            TranscriptionJobName=job_name,
+            Media={'MediaFileUri': media_uri},
+            MediaFormat=media_format,
+            LanguageCode='en-US',
+            Settings={
+                'ShowSpeakerLabels': False,
+                'MaxSpeakerLabels': 2,
+                'ShowAlternatives': False,
+                'MaxAlternatives': 1
+            }
+        )
+        
+        logger.info(f"Successfully started transcription job: {job_name}")
+        return job_name
+        
+    except (ClientError, BotoCoreError) as e:
+        # Let the retry decorator handle AWS-specific errors
+        raise e
+    except Exception as e:
+        logger.error(f"Unexpected error starting transcription job: {str(e)}")
+        raise RuntimeError(f"Failed to start transcription job: {str(e)}")
 
 
 def get_media_format(key_name: str) -> str:
