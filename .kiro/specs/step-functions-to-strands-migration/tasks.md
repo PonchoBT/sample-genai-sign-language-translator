@@ -7,27 +7,27 @@
   - Implement basic agent initialization with Nova Lite model
   - _Requirements: 1.1, 4.1, 4.3_
 
-- [ ] 2. Convert existing Lambda functions to Strands tools
-  - [ ] 2.1 Convert text2gloss function to Strands tool
+- [x] 2. Convert existing Lambda functions to Strands tools
+  - [x] 2.1 Convert text2gloss function to Strands tool
     - Refactor text2gloss_handler.py to use @tool decorator
     - Preserve existing Bedrock integration and prompt logic
     - Add proper error handling and retry mechanisms
     - _Requirements: 2.1, 2.4_
 
-  - [ ] 2.2 Convert gloss2pose function to Strands tool
+  - [x] 2.2 Convert gloss2pose function to Strands tool
     - Refactor gloss2pose_handler.py to use @tool decorator
     - Maintain multi-threaded video processing capabilities
     - Preserve S3 integration and FFmpeg functionality
     - Add proper parameter validation and error handling
     - _Requirements: 2.2, 2.4_
 
-  - [ ] 2.3 Create audio processing tool from existing functions
+  - [x] 2.3 Create audio processing tool from existing functions
     - Combine audio2sign and process_transcription logic into unified tool
     - Implement transcription job management and status polling
     - Add proper error handling for AWS Transcribe integration
     - _Requirements: 2.3, 2.4_
 
-  - [ ] 2.4 Create real-time ASL analysis tool from websocket handler
+  - [x] 2.4 Create real-time ASL analysis tool from websocket handler
     - Extract ASL video analysis logic from websocket handler
     - Create tool for processing Kinesis Video Streams
     - Implement image processing and Bedrock integration for ASL interpretation
