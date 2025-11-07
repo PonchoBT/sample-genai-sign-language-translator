@@ -10,21 +10,19 @@ from pathlib import Path
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
-# Add signlanguageagent module path for agent imports
-current_dir = Path(__file__).parent
-functions_dir = current_dir.parent
-agent_path = functions_dir / 'signlanguageagent'
-if agent_path.exists() and str(agent_path) not in sys.path:
-    sys.path.insert(0, str(agent_path))
+# AgentCore configuration
+AGENTCORE_AGENT_ID = os.environ.get('AGENTCORE_AGENT_ID')
+AGENTCORE_AGENT_ARN = os.environ.get('AGENTCORE_AGENT_ARN')
+AGENTCORE_REGION = os.environ.get('AGENTCORE_REGION', 'us-west-2')
 
-# Import the Strands agent
-try:
-    from slagent import app as agent_app
-    AGENT_AVAILABLE = True
-    logger.info("Successfully imported Strands agent")
-except ImportError as e:
-    logger.error(f"Failed to import Strands agent: {e}")
-    AGENT_AVAILABLE = False
+# Initialize Bedrock AgentCore client
+bedrock_agentcore = boto3.client('bedrock-agentcore-runtime', region_name=AGENTCORE_REGION)
+
+AGENT_AVAILABLE = bool(AGENTCORE_AGENT_ID and AGENTCORE_AGENT_ARN)
+if AGENT_AVAILABLE:
+    logger.info(f"AgentCore agent available: {AGENTCORE_AGENT_ID}")
+else:
+    logger.warning("AgentCore agent not configured")
 
 def lambda_handler(event, context):
     """
@@ -48,7 +46,7 @@ def lambda_handler(event, context):
         
         # Check if agent is available
         if not AGENT_AVAILABLE:
-            return format_error_response("Strands agent is not available", 503)
+            return format_error_response("AgentCore agent is not available", 503)
         
         # Extract query parameters
         query_params = event.get("queryStringParameters") or {}
@@ -57,18 +55,28 @@ def lambda_handler(event, context):
         if "sfn_execution_arn" in query_params:
             return handle_legacy_status_request(query_params["sfn_execution_arn"])
         
-        # Route request to appropriate agent workflow
-        agent_payload = build_agent_payload(query_params, event)
+        # Build input text for the agent
+        input_text, metadata = build_agent_input(query_params, event)
         
-        logger.info(f"Invoking agent with payload: {agent_payload}")
+        # Generate session ID
+        session_id = event.get("requestContext", {}).get("requestId", str(int(time.time())))
         
-        # Invoke the Strands agent
-        agent_response = agent_app.invoke(agent_payload)
+        logger.info(f"Invoking AgentCore agent {AGENTCORE_AGENT_ID} with input: {input_text}")
+        
+        # Invoke the AgentCore agent
+        response = bedrock_agentcore.invoke_agent(
+            agentId=AGENTCORE_AGENT_ID,
+            sessionId=session_id,
+            inputText=input_text
+        )
+        
+        # Process the streaming response
+        agent_response = process_agentcore_response(response)
         
         # Format response to maintain API compatibility
         formatted_response = format_agent_response(agent_response, query_params)
         
-        logger.info("Agent invocation completed successfully")
+        logger.info("AgentCore agent invocation completed successfully")
         
         return {
             'statusCode': 200,
@@ -85,42 +93,74 @@ def lambda_handler(event, context):
         logger.error(error_msg, exc_info=True)
         return format_error_response(error_msg, 500)
 
-def build_agent_payload(query_params, event):
-    """Build agent payload from API request parameters"""
-    payload = {
-        "session_id": event.get("requestContext", {}).get("requestId"),
-        "metadata": {}
-    }
+def build_agent_input(query_params, event):
+    """Build agent input text from API request parameters"""
+    metadata = {}
     
-    # Determine request type and build appropriate payload
+    # Determine request type and build appropriate input
     if "Gloss" in query_params:
         # Direct gloss-to-video request
-        payload["message"] = f"Convert this ASL gloss to video: {query_params['Gloss']}"
-        payload["type"] = "text"
-        payload["metadata"]["gloss"] = query_params["Gloss"]
+        input_text = f"Convert this ASL gloss to video: {query_params['Gloss']}"
+        metadata["gloss"] = query_params["Gloss"]
+        metadata["type"] = "gloss"
         
     elif "Text" in query_params:
         # Text-to-ASL translation request
-        payload["message"] = query_params["Text"]
-        payload["type"] = "text"
-        payload["metadata"]["text"] = query_params["Text"]
+        input_text = query_params["Text"]
+        metadata["text"] = query_params["Text"]
+        metadata["type"] = "text"
         
     elif "BucketName" in query_params and "KeyName" in query_params:
         # Audio-to-ASL translation request
-        payload["message"] = f"Process audio file from S3 and convert to ASL"
-        payload["type"] = "audio"
-        payload["metadata"]["bucket_name"] = query_params["BucketName"]
-        payload["metadata"]["key_name"] = query_params["KeyName"]
-        payload["BucketName"] = query_params["BucketName"]
-        payload["KeyName"] = query_params["KeyName"]
+        input_text = f"Process audio file from S3 bucket {query_params['BucketName']} with key {query_params['KeyName']} and convert to ASL"
+        metadata["bucket_name"] = query_params["BucketName"]
+        metadata["key_name"] = query_params["KeyName"]
+        metadata["type"] = "audio"
         
     else:
         # Default to text processing if no specific parameters
-        message = query_params.get("message", "Hello")
-        payload["message"] = message
-        payload["type"] = "text"
+        input_text = query_params.get("message", "Hello")
+        metadata["type"] = "text"
     
-    return payload
+    return input_text, metadata
+
+def process_agentcore_response(response):
+    """Process AgentCore streaming response and extract the result"""
+    try:
+        # AgentCore returns a streaming response
+        event_stream = response.get('completion', [])
+        
+        result_text = ""
+        result_data = {}
+        
+        for event in event_stream:
+            if 'chunk' in event:
+                chunk = event['chunk']
+                if 'bytes' in chunk:
+                    # Decode the bytes to text
+                    chunk_text = chunk['bytes'].decode('utf-8')
+                    result_text += chunk_text
+            elif 'trace' in event:
+                # Handle trace events for debugging
+                trace = event['trace']
+                logger.info(f"Agent trace: {trace}")
+            elif 'returnControl' in event:
+                # Handle return control events
+                return_control = event['returnControl']
+                logger.info(f"Agent return control: {return_control}")
+                result_data = return_control
+        
+        # Try to parse as JSON if possible
+        try:
+            parsed_result = json.loads(result_text)
+            return parsed_result
+        except json.JSONDecodeError:
+            # Return as plain text if not JSON
+            return result_text if result_text else result_data
+            
+    except Exception as e:
+        logger.error(f"Error processing AgentCore response: {e}", exc_info=True)
+        return f"Error processing agent response: {str(e)}"
 
 def format_agent_response(agent_response, query_params):
     """Format agent response using the enhanced response formatter"""
@@ -230,7 +270,7 @@ def handle_legacy_status_request(execution_arn):
         },
         'body': json.dumps({
             "status": "SUCCEEDED",
-            "message": "Request processed by Strands agent",
+            "message": "Request processed by AgentCore agent",
             "timestamp": int(time.time())
         })
     }

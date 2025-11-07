@@ -344,7 +344,9 @@ export class GenASLBackendStack extends Stack {
           environment: {
               STATE_MACHINE_ARN: stateMachine.stateMachineArn,
               STATE_MACHINE_ARN_BLENDED_POSE: blendedPoseStateMachine.stateMachineArn,
-              AGENT_FUNCTION_NAME: signLanguageAgentFunction.functionName
+              AGENTCORE_AGENT_ID: 'slagent-4BncgN2p1h',
+              AGENTCORE_AGENT_ARN: 'arn:aws:bedrock-agentcore:us-west-2:853513360253:runtime/slagent-4BncgN2p1h',
+              AGENTCORE_REGION: 'us-west-2'
           },
       });
 
@@ -358,22 +360,25 @@ export class GenASLBackendStack extends Stack {
           resources: ["*"],
         }));
 
-        // Grant audio2SignFunction permission to invoke the agent
+        // Grant audio2SignFunction permission to invoke the agentcore agent
         audio2SignFunction.addToRolePolicy(new iam.PolicyStatement({
             effect: iam.Effect.ALLOW,
-            actions: ['lambda:InvokeFunction'],
-            resources: [signLanguageAgentFunction.functionArn],
+            actions: [
+                'bedrock-agentcore:InvokeAgent',
+                'bedrock-agentcore:InvokeAgentStreaming'
+            ],
+            resources: ['arn:aws:bedrock-agentcore:us-west-2:853513360253:runtime/slagent-4BncgN2p1h'],
         }));
 
-        // Create the Strands Agent Lambda function
+        // Create the Conversational ASL Agent Lambda function (enhanced SignLanguageAgent)
         const signLanguageAgentFunction = new lambda.Function(this, 'SignLanguageAgentFunction', {
             runtime: lambda.Runtime.PYTHON_3_11,
-            handler: 'slagent.app.entrypoint',
-            code: lambda.Code.fromAsset('./amplify/custom/functions/signlanguageagent'),
+            handler: 'conversational_asl_agent_main.invoke',
+            code: lambda.Code.fromAsset('./amplify/custom/functions/conversational_asl_agent'),
             functionName: 'SignLanguageAgentFunction-' + (config.amplifyEnv || 'dev'),
-            description: 'Strands-based agent for ASL translation orchestration',
+            description: 'Conversational bidirectional ASL agent with enhanced natural language capabilities',
             timeout: Duration.seconds(900), // 15 minutes for complex workflows
-            memorySize: 1024, // Higher memory for agent processing
+            memorySize: 1536, // Increased memory for conversational processing and context management
             layers: [ffmpegLayer],
             tracing: lambda.Tracing.ACTIVE, // Enable X-Ray tracing
             environment: {
@@ -386,7 +391,18 @@ export class GenASLBackendStack extends Stack {
                 REGION: config.region,
                 // AgentCore specific environment variables
                 BEDROCK_AGENT_RUNTIME_REGION: config.region,
-                LOG_LEVEL: 'INFO'
+                LOG_LEVEL: 'INFO',
+                // Conversational agent specific environment variables
+                CONVERSATION_MEMORY_TTL: '3600', // 1 hour session timeout
+                CONVERSATION_HISTORY_LIMIT: '50', // Maximum conversation history items
+                CONVERSATION_CONTEXT_CLEANUP_INTERVAL: '300', // 5 minutes cleanup interval
+                CONVERSATION_ENABLE_PROACTIVE_TIPS: 'true',
+                CONVERSATION_ENABLE_CONTEXT_ANALYSIS: 'true',
+                CONVERSATION_RESPONSE_ENHANCEMENT: 'true',
+                // Memory optimization settings
+                AGENTCORE_MEMORY_OPTIMIZATION: 'true',
+                AGENTCORE_MEMORY_COMPRESSION: 'true',
+                AGENTCORE_MEMORY_BATCH_SIZE: '10'
             },
         });
 
@@ -497,6 +513,7 @@ export class GenASLBackendStack extends Stack {
 
         // Create custom CloudWatch metrics for translation pipeline monitoring
         const translationMetricsNamespace = 'GenASL/Translation';
+        const conversationMetricsNamespace = 'GenASL/Conversation';
 
         // Create CloudWatch Dashboard for monitoring
         const dashboard = new cloudwatch.Dashboard(this, 'GenASLDashboard', {
@@ -506,13 +523,71 @@ export class GenASLBackendStack extends Stack {
         // Add Lambda function metrics to dashboard
         dashboard.addWidgets(
             new cloudwatch.GraphWidget({
-                title: 'Agent Function Invocations',
+                title: 'Conversational Agent Function Metrics',
                 left: [signLanguageAgentFunction.metricInvocations()],
                 right: [signLanguageAgentFunction.metricErrors()],
             }),
             new cloudwatch.GraphWidget({
-                title: 'Agent Function Duration',
+                title: 'Conversational Agent Duration & Memory',
                 left: [signLanguageAgentFunction.metricDuration()],
+                right: [
+                    new cloudwatch.Metric({
+                        namespace: 'AWS/Lambda',
+                        metricName: 'MemoryUtilization',
+                        dimensionsMap: {
+                            FunctionName: signLanguageAgentFunction.functionName,
+                        },
+                    }),
+                ],
+            }),
+            new cloudwatch.GraphWidget({
+                title: 'Conversation Success Rates',
+                left: [
+                    new cloudwatch.Metric({
+                        namespace: conversationMetricsNamespace,
+                        metricName: 'ConversationSuccess',
+                        statistic: 'Sum',
+                    }),
+                    new cloudwatch.Metric({
+                        namespace: conversationMetricsNamespace,
+                        metricName: 'ConversationFailure',
+                        statistic: 'Sum',
+                    }),
+                ],
+                right: [
+                    new cloudwatch.Metric({
+                        namespace: conversationMetricsNamespace,
+                        metricName: 'IntentClassificationAccuracy',
+                        statistic: 'Average',
+                    }),
+                ],
+            }),
+            new cloudwatch.GraphWidget({
+                title: 'Session Lifecycle Metrics',
+                left: [
+                    new cloudwatch.Metric({
+                        namespace: conversationMetricsNamespace,
+                        metricName: 'SessionsCreated',
+                        statistic: 'Sum',
+                    }),
+                    new cloudwatch.Metric({
+                        namespace: conversationMetricsNamespace,
+                        metricName: 'SessionsActive',
+                        statistic: 'Average',
+                    }),
+                ],
+                right: [
+                    new cloudwatch.Metric({
+                        namespace: conversationMetricsNamespace,
+                        metricName: 'SessionDuration',
+                        statistic: 'Average',
+                    }),
+                    new cloudwatch.Metric({
+                        namespace: conversationMetricsNamespace,
+                        metricName: 'MemoryUsage',
+                        statistic: 'Average',
+                    }),
+                ],
             }),
             new cloudwatch.GraphWidget({
                 title: 'Translation Pipeline Functions',
@@ -558,11 +633,63 @@ export class GenASLBackendStack extends Stack {
         );
 
         // Create CloudWatch Alarms for critical errors
-        const agentErrorAlarm = new cloudwatch.Alarm(this, 'AgentErrorAlarm', {
+        const conversationalAgentErrorAlarm = new cloudwatch.Alarm(this, 'ConversationalAgentErrorAlarm', {
             metric: signLanguageAgentFunction.metricErrors(),
             threshold: 5,
             evaluationPeriods: 2,
-            alarmDescription: 'Sign Language Agent function errors',
+            alarmDescription: 'Conversational ASL Agent function errors',
+        });
+
+        const conversationalAgentDurationAlarm = new cloudwatch.Alarm(this, 'ConversationalAgentDurationAlarm', {
+            metric: signLanguageAgentFunction.metricDuration(),
+            threshold: 30000, // 30 seconds
+            evaluationPeriods: 3,
+            alarmDescription: 'Conversational ASL Agent function duration too high',
+        });
+
+        const conversationSuccessRateAlarm = new cloudwatch.Alarm(this, 'ConversationSuccessRateAlarm', {
+            metric: new cloudwatch.MathExpression({
+                expression: '(conversation_success / (conversation_success + conversation_failure)) * 100',
+                usingMetrics: {
+                    conversation_success: new cloudwatch.Metric({
+                        namespace: conversationMetricsNamespace,
+                        metricName: 'ConversationSuccess',
+                        statistic: 'Sum',
+                    }),
+                    conversation_failure: new cloudwatch.Metric({
+                        namespace: conversationMetricsNamespace,
+                        metricName: 'ConversationFailure',
+                        statistic: 'Sum',
+                    }),
+                },
+            }),
+            threshold: 85, // Alert if success rate drops below 85%
+            evaluationPeriods: 3,
+            comparisonOperator: cloudwatch.ComparisonOperator.LESS_THAN_THRESHOLD,
+            alarmDescription: 'Conversation success rate too low',
+        });
+
+        const memoryUsageAlarm = new cloudwatch.Alarm(this, 'ConversationMemoryUsageAlarm', {
+            metric: new cloudwatch.Metric({
+                namespace: conversationMetricsNamespace,
+                metricName: 'MemoryUsage',
+                statistic: 'Average',
+            }),
+            threshold: 1000, // Alert if average memory usage exceeds 1000 MB
+            evaluationPeriods: 2,
+            alarmDescription: 'Conversation memory usage too high',
+        });
+
+        const intentClassificationAccuracyAlarm = new cloudwatch.Alarm(this, 'IntentClassificationAccuracyAlarm', {
+            metric: new cloudwatch.Metric({
+                namespace: conversationMetricsNamespace,
+                metricName: 'IntentClassificationAccuracy',
+                statistic: 'Average',
+            }),
+            threshold: 80, // Alert if accuracy drops below 80%
+            evaluationPeriods: 3,
+            comparisonOperator: cloudwatch.ComparisonOperator.LESS_THAN_THRESHOLD,
+            alarmDescription: 'Intent classification accuracy too low',
         });
 
         const translationPipelineErrorAlarm = new cloudwatch.Alarm(this, 'TranslationPipelineErrorAlarm', {
@@ -728,7 +855,9 @@ export class GenASLBackendStack extends Stack {
             DYNAMO_TABLE_NAME: websocketTable.tableName,
             INPUT_BUCKET: this.dataBucket.bucketName,
             ASL_TO_ENG_MODEL: config.asl_to_eng_model,
-            AGENT_FUNCTION_NAME: signLanguageAgentFunction.functionName
+            AGENTCORE_AGENT_ID: 'slagent-4BncgN2p1h',
+            AGENTCORE_AGENT_ARN: 'arn:aws:bedrock-agentcore:us-west-2:853513360253:runtime/slagent-4BncgN2p1h',
+            AGENTCORE_REGION: 'us-west-2'
         },
     });
     websocketTable.grantReadWriteData(onConnectFunction);
@@ -752,11 +881,14 @@ export class GenASLBackendStack extends Stack {
     OnDefaultFunction.addToRolePolicy(kvsPolicy)
     OnDefaultFunction.addToRolePolicy(xrayPolicy)
     
-    // Grant WebSocket function permission to invoke the agent
+    // Grant WebSocket function permission to invoke the agentcore agent
     OnDefaultFunction.addToRolePolicy(new iam.PolicyStatement({
         effect: iam.Effect.ALLOW,
-        actions: ['lambda:InvokeFunction'],
-        resources: [signLanguageAgentFunction.functionArn],
+        actions: [
+            'bedrock-agentcore:InvokeAgent',
+            'bedrock-agentcore:InvokeAgentStreaming'
+        ],
+        resources: ['arn:aws:bedrock-agentcore:us-west-2:853513360253:runtime/slagent-4BncgN2p1h'],
     }));
     
     // Add S3 full access permissions for genasl-data bucket

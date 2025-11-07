@@ -18,24 +18,20 @@ BUCKET_NAME = os.environ['INPUT_BUCKET']
 ASL_TO_ENG_MODEL = os.environ['ASL_TO_ENG_MODEL']
 ASL_TO_ENG_MODEL = "us.meta.llama3-2-11b-instruct-v1:0"
 
-# Initialize Bedrock client
+# AgentCore configuration
+AGENTCORE_AGENT_ID = os.environ.get('AGENTCORE_AGENT_ID')
+AGENTCORE_AGENT_ARN = os.environ.get('AGENTCORE_AGENT_ARN')
+AGENTCORE_REGION = os.environ.get('AGENTCORE_REGION', 'us-west-2')
+
+# Initialize Bedrock clients
 bedrock_runtime = boto3.client('bedrock-runtime', region_name='us-east-1')
+bedrock_agentcore = boto3.client('bedrock-agentcore-runtime', region_name=AGENTCORE_REGION)
 
-# Add signlanguageagent module path for agent imports
-current_dir = Path(__file__).parent
-functions_dir = current_dir.parent
-agent_path = functions_dir / 'signlanguageagent'
-if agent_path.exists() and str(agent_path) not in sys.path:
-    sys.path.insert(0, str(agent_path))
-
-# Import the Strands agent
-try:
-    from slagent import app as agent_app
-    AGENT_AVAILABLE = True
-    print("Successfully imported Strands agent for WebSocket")
-except ImportError as e:
-    print(f"Failed to import Strands agent: {e}")
-    AGENT_AVAILABLE = False
+AGENT_AVAILABLE = bool(AGENTCORE_AGENT_ID and AGENTCORE_AGENT_ARN)
+if AGENT_AVAILABLE:
+    print(f"AgentCore agent available: {AGENTCORE_AGENT_ID}")
+else:
+    print("AgentCore agent not configured")
 
 
 def default(event, context):
@@ -88,91 +84,124 @@ def default(event, context):
     }
 
 def process_websocket_message_with_agent(data, connection_id, event):
-    """Process structured WebSocket message using Strands agent"""
+    """Process structured WebSocket message using AgentCore agent"""
     
     if not AGENT_AVAILABLE:
         # Fallback to legacy processing
         return process_legacy_websocket_message(data)
     
     try:
-        # Build agent payload based on message content
-        agent_payload = {
-            "session_id": connection_id,
-            "metadata": {}
-        }
-        
+        # Build agent input based on message content
         stream_name = data.get('StreamName', '')
         bucket_name = data.get('BucketName', '')
         key_name = data.get('KeyName', '')
         text_content = data.get('text', data.get('message', ''))
         
+        # Construct the input message for the agent
         if stream_name:
-            # ASL video stream analysis
-            agent_payload["message"] = f"Analyze ASL video from Kinesis stream: {stream_name}"
-            agent_payload["type"] = "video"
-            agent_payload["metadata"]["stream_name"] = stream_name
-            agent_payload["StreamName"] = stream_name
-            
+            input_text = f"Analyze ASL video from Kinesis stream: {stream_name}"
+            input_data = {"StreamName": stream_name, "type": "video"}
         elif bucket_name and key_name:
-            # ASL video/audio file analysis
             if key_name.lower().endswith(('.mp4', '.webm', '.avi', '.mov')):
-                agent_payload["message"] = f"Analyze ASL video from S3: {bucket_name}/{key_name}"
-                agent_payload["type"] = "video"
+                input_text = f"Analyze ASL video from S3: {bucket_name}/{key_name}"
+                input_data = {"BucketName": bucket_name, "KeyName": key_name, "type": "video"}
             else:
-                agent_payload["message"] = f"Process audio file from S3: {bucket_name}/{key_name}"
-                agent_payload["type"] = "audio"
-            
-            agent_payload["metadata"]["bucket_name"] = bucket_name
-            agent_payload["metadata"]["key_name"] = key_name
-            agent_payload["BucketName"] = bucket_name
-            agent_payload["KeyName"] = key_name
-            
+                input_text = f"Process audio file from S3: {bucket_name}/{key_name}"
+                input_data = {"BucketName": bucket_name, "KeyName": key_name, "type": "audio"}
         elif text_content:
-            # Text translation
-            agent_payload["message"] = text_content
-            agent_payload["type"] = "text"
-            
+            input_text = text_content
+            input_data = {"type": "text"}
         else:
-            # Default help message
-            agent_payload["message"] = "Hello, how can I help you with ASL translation?"
-            agent_payload["type"] = "text"
+            input_text = "Hello, how can I help you with ASL translation?"
+            input_data = {"type": "text"}
         
-        print(f"Invoking agent with payload: {agent_payload}")
+        print(f"Invoking AgentCore agent {AGENTCORE_AGENT_ID} with input: {input_text}")
         
-        # Invoke the Strands agent
-        agent_response = agent_app.invoke(agent_payload)
+        # Invoke the AgentCore agent
+        response = bedrock_agentcore.invoke_agent(
+            agentId=AGENTCORE_AGENT_ID,
+            sessionId=connection_id,
+            inputText=input_text
+        )
+        
+        # Process the streaming response
+        agent_response = process_agentcore_response(response)
         
         # Format response for WebSocket
         return format_websocket_agent_response(agent_response, data)
         
     except Exception as e:
-        print(f"Error invoking agent for WebSocket: {e}")
+        print(f"Error invoking AgentCore agent for WebSocket: {e}")
+        import traceback
+        traceback.print_exc()
         return f"I encountered an error processing your request: {str(e)}"
 
 def process_text_message_with_agent(message, connection_id, event):
-    """Process plain text WebSocket message using Strands agent"""
+    """Process plain text WebSocket message using AgentCore agent"""
     
     if not AGENT_AVAILABLE:
         return f"Echo: {message}"
     
     try:
-        agent_payload = {
-            "message": message,
-            "type": "text",
-            "session_id": connection_id,
-            "metadata": {}
-        }
+        print(f"Processing text message with AgentCore agent: {message}")
         
-        print(f"Processing text message with agent: {message}")
+        # Invoke the AgentCore agent
+        response = bedrock_agentcore.invoke_agent(
+            agentId=AGENTCORE_AGENT_ID,
+            sessionId=connection_id,
+            inputText=message
+        )
         
-        # Invoke the Strands agent
-        agent_response = agent_app.invoke(agent_payload)
+        # Process the streaming response
+        agent_response = process_agentcore_response(response)
         
         return agent_response
         
     except Exception as e:
-        print(f"Error processing text message with agent: {e}")
+        print(f"Error processing text message with AgentCore agent: {e}")
+        import traceback
+        traceback.print_exc()
         return f"I encountered an error: {str(e)}"
+
+def process_agentcore_response(response):
+    """Process AgentCore streaming response and extract the result"""
+    try:
+        # AgentCore returns a streaming response
+        event_stream = response.get('completion', [])
+        
+        result_text = ""
+        result_data = {}
+        
+        for event in event_stream:
+            if 'chunk' in event:
+                chunk = event['chunk']
+                if 'bytes' in chunk:
+                    # Decode the bytes to text
+                    chunk_text = chunk['bytes'].decode('utf-8')
+                    result_text += chunk_text
+            elif 'trace' in event:
+                # Handle trace events for debugging
+                trace = event['trace']
+                print(f"Agent trace: {trace}")
+            elif 'returnControl' in event:
+                # Handle return control events
+                return_control = event['returnControl']
+                print(f"Agent return control: {return_control}")
+                result_data = return_control
+        
+        # Try to parse as JSON if possible
+        try:
+            parsed_result = json.loads(result_text)
+            return parsed_result
+        except json.JSONDecodeError:
+            # Return as plain text if not JSON
+            return result_text if result_text else result_data
+            
+    except Exception as e:
+        print(f"Error processing AgentCore response: {e}")
+        import traceback
+        traceback.print_exc()
+        return f"Error processing agent response: {str(e)}"
 
 def format_websocket_agent_response(agent_response, original_data):
     """Format agent response for WebSocket broadcast using enhanced formatter"""
