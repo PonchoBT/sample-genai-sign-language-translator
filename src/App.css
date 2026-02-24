@@ -1,3 +1,6 @@
+@import url("https://fonts.googleapis.com/css?family=Raleway:400,500,600");
+@import url("https://fonts.cdnfonts.com/css/amazon-ember");
+
 .App {
   text-align: center;
 }
@@ -209,10 +212,6 @@
 .translate-btn-txt {
   font-size: 1vw;
 }
-
-/* */
-@import url("https://fonts.googleapis.com/css?family=Raleway:400,500,600");
-@import url("https://fonts.cdnfonts.com/css/amazon-ember");
 
 * {
   padding: 0;

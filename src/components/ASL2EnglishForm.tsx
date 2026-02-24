@@ -2,7 +2,7 @@ import "./ASL2English.css";
 import { Component, FormEvent } from "react";
 import { getUrl, uploadData } from "aws-amplify/storage";
 import CameraImageName from "../assets/camera.png";
-import IconButton from "@material-ui/core/IconButton";
+import IconButton from "@mui/material/IconButton";
 import ListenAudioImageName from "../assets/play-button.png";
 import React from "react";
 import StopCameraImageName from "../assets/stop-button.png";
@@ -13,7 +13,7 @@ import StreamingImageName from "../assets/sign-language-green.png";
 
 import Tooltip from "@mui/material/Tooltip";
 import UploadImageName from "../assets/upload-red.png";
-import outputs from "../../amplify_outputs.json";
+import outputs from "../config/amplifyOutputs";
 import uuid from "react-uuid";
 
 const amplify_env = outputs.custom.ENV.amplify_env;

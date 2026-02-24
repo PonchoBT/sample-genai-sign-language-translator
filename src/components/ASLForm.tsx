@@ -2,14 +2,14 @@ import "./ASLForm.css";
 
 import React, { Component, FormEvent } from "react";
 
-import IconButton from "@material-ui/core/IconButton";
+import IconButton from "@mui/material/IconButton";
 import ListenImageName from "../assets/voice-blue.png";
 import StopImageName from "../assets/stop-button.png";
 import Tooltip from "@mui/material/Tooltip";
 import TranslateImageName from "../assets/sign-language-green.png";
 import UploadImageName from "../assets/upload-red.png";
 import { fetchAuthSession } from "aws-amplify/auth";
-import outputs from "../../amplify_outputs.json";
+import outputs from "../config/amplifyOutputs";
 import {getUrl, uploadData} from "aws-amplify/storage";
 import uuid from "react-uuid";
 

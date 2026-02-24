@@ -2,7 +2,7 @@ import './Text2Speech.css';
 import { post } from 'aws-amplify/api';
 import React, { useState } from 'react';
 // import axios from 'axios';
-import outputs from "../../amplify_outputs.json";
+import outputs from "../config/amplifyOutputs";
 
 const TextToSpeechConverter: React.FC = () => {
   const [inputText, setInputText] = useState('');
