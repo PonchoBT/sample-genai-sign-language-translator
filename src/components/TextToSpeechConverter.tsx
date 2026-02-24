@@ -2,14 +2,14 @@ import './Text2Speech.css';
 import { post } from 'aws-amplify/api';
 import React, { useState } from 'react';
 // import axios from 'axios';
-import outputs from "../../amplify_outputs.json";
+import { amplifyEnv } from "../config/amplifyOutputs";
 
 const TextToSpeechConverter: React.FC = () => {
   const [inputText, setInputText] = useState('');
   const [audioUrl, setAudioUrl] = useState('');
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState('');
-  const amplify_env=outputs.custom.ENV.amplify_env;
+  const amplify_env = amplifyEnv;
 
 
   const handleConvert = async () => {

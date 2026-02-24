@@ -2,7 +2,7 @@ import "./ASL2English.css";
 import { Component, FormEvent } from "react";
 import { getUrl, uploadData } from "aws-amplify/storage";
 import CameraImageName from "../assets/camera.png";
-import IconButton from "@material-ui/core/IconButton";
+import IconButton from "@mui/material/IconButton";
 import ListenAudioImageName from "../assets/play-button.png";
 import React from "react";
 import StopCameraImageName from "../assets/stop-button.png";
@@ -13,14 +13,15 @@ import StreamingImageName from "../assets/sign-language-green.png";
 
 import Tooltip from "@mui/material/Tooltip";
 import UploadImageName from "../assets/upload-red.png";
-import outputs from "../../amplify_outputs.json";
+import {
+  restApiEndpoint,
+  storageBucketName,
+  wssApiEndpoint,
+} from "../config/amplifyOutputs";
 import uuid from "react-uuid";
 
-const amplify_env = outputs.custom.ENV.amplify_env;
-// @ts-ignore
-const apiUrl = outputs.custom.API[`GenASLAPI${amplify_env}`]?.endpoint || outputs.custom.API['GenASLAPImain']?.endpoint || 'API_NOT_CONFIGURED';
-// @ts-ignore
-const wssUrl = outputs.custom.WSS[`GenASLWSS${amplify_env}`]?.endpoint || outputs.custom.WSS['GenASLWSSmain']?.endpoint || 'WSS_NOT_CONFIGURED';
+const apiUrl = restApiEndpoint;
+const wssUrl = wssApiEndpoint;
 //const region = outputs.custom.ENV.region; // Provide a default if not set
 
 type ASL2EnglishState = {
@@ -229,7 +230,7 @@ class ASL2EnglishForm extends Component<ASL2EnglishProps, ASL2EnglishState> {
       //send kinesis or s3 information
       let command={}
         console.log("file")
-        command={BucketName:outputs.storage.bucket_name, KeyName:"public/" + this.state.inputFile}
+        command={BucketName: storageBucketName, KeyName:"public/" + this.state.inputFile}
       //establish the WSS connection if it's not already established
       if (!this.ws || this.ws.readyState === WebSocket.CLOSED) {
         await this.wsscomponentMount();
@@ -352,7 +353,7 @@ class ASL2EnglishForm extends Component<ASL2EnglishProps, ASL2EnglishState> {
                });
                console.log("Video recorded and uploaded successfully");
               let command={};
-              command={BucketName:outputs.storage.bucket_name, KeyName:path};
+              command={BucketName: storageBucketName, KeyName:path};
               //establish the WSS connection if it's not already established
               if (!this.ws || this.ws.readyState === WebSocket.CLOSED) {
                  await this.wsscomponentMount();
@@ -455,7 +456,7 @@ class ASL2EnglishForm extends Component<ASL2EnglishProps, ASL2EnglishState> {
       await uploadTask.result;
       console.log("finished uploading");
       
-      console.log("bucketName", outputs.storage.bucket_name);
+      console.log("bucketName", storageBucketName);
  
       this.setState({ inputFile: keyName });
 

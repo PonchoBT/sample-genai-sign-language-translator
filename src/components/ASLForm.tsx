@@ -2,20 +2,23 @@ import "./ASLForm.css";
 
 import React, { Component, FormEvent } from "react";
 
-import IconButton from "@material-ui/core/IconButton";
+import IconButton from "@mui/material/IconButton";
 import ListenImageName from "../assets/voice-blue.png";
 import StopImageName from "../assets/stop-button.png";
 import Tooltip from "@mui/material/Tooltip";
 import TranslateImageName from "../assets/sign-language-green.png";
 import UploadImageName from "../assets/upload-red.png";
 import { fetchAuthSession } from "aws-amplify/auth";
-import outputs from "../../amplify_outputs.json";
+import {
+  amplifyEnv,
+  restApiEndpoint,
+  storageBucketName,
+} from "../config/amplifyOutputs";
 import {getUrl, uploadData} from "aws-amplify/storage";
 import uuid from "react-uuid";
 
-const amplify_env = outputs.custom.ENV.amplify_env;
-// @ts-ignore
-const apiUrl = outputs.custom.API[`GenASLAPI${amplify_env}`]?.endpoint || outputs.custom.API['GenASLAPImain']?.endpoint || 'API_NOT_CONFIGURED';
+const amplify_env = amplifyEnv;
+const apiUrl = restApiEndpoint;
 
 // const apiUrl ="https://8yt8q8ij18.execute-api.us-west-2.amazonaws.com/prod/audio-to-sign";
 
@@ -138,7 +141,7 @@ class ASLForm extends Component<ASLFormProps, ASLFormState> {
       this.setState({ inputVideo: linkToUploadedFile.url.href });
 
       this.getSignVideos({
-        BucketName: outputs.storage.bucket_name,
+        BucketName: storageBucketName,
         KeyName: "public/" + keyName,
       });
     } catch (error) {
